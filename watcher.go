@@ -89,6 +89,8 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				log.Println("static configuration json generation failed")
 			}
 
+			staticConfigurations = deDupStaticConfig(staticConfigurations);
+
 			// handle events from the workload entries watch
 			wle, ok := event.Object.(*v1beta1.WorkloadEntry)
 			if !ok {
@@ -110,9 +112,16 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
 			default: // add or update
 				log.Printf("handle update workload %s", wle.Spec.Address)
-				newTarget := make(map[string][]string)
-				newTarget["targets"] = append(newTarget["targets"], fmt.Sprintf("%s:15020", wle.Spec.Address))
-				staticConfigurations = append(staticConfigurations, newTarget)
+				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
+
+				// Remove duplicates from the node IPs.
+				if checkDuplicates(staticConfigurations, newTargetAddr) {
+					log.Printf("workload target endpoint %s exists in configuration", newTargetAddr)
+				} else {
+					newTarget := make(map[string][]string)
+					newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
+					staticConfigurations = append(staticConfigurations, newTarget)
+				}
 			}
 
 			// assign the updated static configurations to the config map
@@ -174,4 +183,35 @@ func updatePromSDConfigMap(client *kubernetes.Clientset, fileSDConfig *v1.Config
 		return err
 	}
 	return nil
+}
+
+func checkDuplicates(values []map[string][]string, value string) bool {
+	for _, target := range values {
+		for _, ip := range target["targets"] {
+			if ip == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func deDupStaticConfig(values []map[string][]string) []map[string][]string {
+	set := make(map[string]bool)
+	var res []map[string][]string
+
+	for _, target := range values {
+		var flag bool
+		for _, ip := range target["targets"] {
+			if _, v := set[ip]; !v {
+				set[ip] = true
+			} else {
+				flag = true
+			}
+		}
+		if !flag {
+			res = append(res, target)
+		}
+	}
+	return res
 }
