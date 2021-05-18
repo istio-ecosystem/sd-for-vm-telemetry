@@ -1,7 +1,7 @@
 .PHONY: format docker
 
 BINARY=vm-discovery
-DOCKER_REPO=jackyzz
+DOCKER_REPO=istioecosystem
 IMAGE=$(DOCKER_REPO)/vm-discovery
 FINDFILES=find . \( -path ./common-protos -o -path ./.git -o -path ./out -o -path ./.github -o -path ./licenses -o -path ./vendor \) -prune -o -type f
 XARGS = xargs -0 -r
