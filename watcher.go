@@ -89,7 +89,7 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				log.Println("static configuration json generation failed")
 			}
 
-			staticConfigurations = deDupStaticConfig(staticConfigurations);
+			staticConfigurations = dedupConfig(staticConfigurations)
 
 			// handle events from the workload entries watch
 			wle, ok := event.Object.(*v1beta1.WorkloadEntry)
@@ -115,13 +115,14 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
 
 				// Remove duplicates from the node IPs.
-				if checkDuplicates(staticConfigurations, newTargetAddr) {
-					log.Printf("workload target endpoint %s exists in configuration", newTargetAddr)
-				} else {
+				existsDupEP := isDuplicate(staticConfigurations, newTargetAddr)
+				if !existsDupEP {
 					newTarget := make(map[string][]string)
 					newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
 					staticConfigurations = append(staticConfigurations, newTarget)
+					break
 				}
+				log.Printf("workload %s already registered as %s\n", wle.Spec.Address, newTargetAddr)
 			}
 
 			// assign the updated static configurations to the config map
@@ -185,10 +186,10 @@ func updatePromSDConfigMap(client *kubernetes.Clientset, fileSDConfig *v1.Config
 	return nil
 }
 
-func checkDuplicates(values []map[string][]string, value string) bool {
-	for _, target := range values {
+func isDuplicate(existing []map[string][]string, newTarget string) bool {
+	for _, target := range existing {
 		for _, ip := range target["targets"] {
-			if ip == value {
+			if ip == newTarget {
 				return true
 			}
 		}
@@ -196,22 +197,22 @@ func checkDuplicates(values []map[string][]string, value string) bool {
 	return false
 }
 
-func deDupStaticConfig(values []map[string][]string) []map[string][]string {
+func dedupConfig(values []map[string][]string) []map[string][]string {
 	set := make(map[string]bool)
-	var res []map[string][]string
+	var config []map[string][]string
 
 	for _, target := range values {
 		var flag bool
 		for _, ip := range target["targets"] {
 			if _, v := set[ip]; !v {
 				set[ip] = true
-			} else {
-				flag = true
+				continue
 			}
+			flag = true
 		}
 		if !flag {
-			res = append(res, target)
+			config = append(config, target)
 		}
 	}
-	return res
+	return config
 }
