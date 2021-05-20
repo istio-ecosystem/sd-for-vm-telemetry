@@ -89,6 +89,8 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				log.Println("static configuration json generation failed")
 			}
 
+			staticConfigurations = dedupConfig(staticConfigurations)
+
 			// handle events from the workload entries watch
 			wle, ok := event.Object.(*v1beta1.WorkloadEntry)
 			if !ok {
@@ -110,9 +112,17 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
 			default: // add or update
 				log.Printf("handle update workload %s", wle.Spec.Address)
-				newTarget := make(map[string][]string)
-				newTarget["targets"] = append(newTarget["targets"], fmt.Sprintf("%s:15020", wle.Spec.Address))
-				staticConfigurations = append(staticConfigurations, newTarget)
+				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
+
+				// Remove duplicates from the node IPs.
+				existsDupEP := isDuplicate(staticConfigurations, newTargetAddr)
+				if !existsDupEP {
+					newTarget := make(map[string][]string)
+					newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
+					staticConfigurations = append(staticConfigurations, newTarget)
+					break
+				}
+				log.Printf("workload %s already registered as %s\n", wle.Spec.Address, newTargetAddr)
 			}
 
 			// assign the updated static configurations to the config map
@@ -174,4 +184,35 @@ func updatePromSDConfigMap(client *kubernetes.Clientset, fileSDConfig *v1.Config
 		return err
 	}
 	return nil
+}
+
+func isDuplicate(existing []map[string][]string, newTarget string) bool {
+	for _, target := range existing {
+		for _, ip := range target["targets"] {
+			if ip == newTarget {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func dedupConfig(values []map[string][]string) []map[string][]string {
+	set := make(map[string]bool)
+	var config []map[string][]string
+
+	for _, target := range values {
+		var flag bool
+		for _, ip := range target["targets"] {
+			if _, v := set[ip]; !v {
+				set[ip] = true
+				continue
+			}
+			flag = true
+		}
+		if !flag {
+			config = append(config, target)
+		}
+	}
+	return config
 }
