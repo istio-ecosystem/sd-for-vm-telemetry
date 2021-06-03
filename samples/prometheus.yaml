@@ -488,8 +488,9 @@ spec:
               subPath: ""
             - name: file-sd-volume
               mountPath: /etc/file_sd
+
         - name: vm-discovery
-          image: "jackyzz/vm-discovery:latest"
+          image: "istioecosystem/vm-discovery:latest"
           imagePullPolicy: "IfNotPresent"
       securityContext:
         fsGroup: 65534

@@ -26,6 +26,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -76,6 +77,14 @@ func NewWatcher(restConfig *rest.Config) *Watcher {
 
 // Start the workload entry watcher. It could be stopped with keyboard interrupt
 func (w *Watcher) Start(stop <-chan struct{}) {
+	if w.namespace == "" {
+		var err error
+		w.namespace, err = discoverPromNamespace(w.k8sClient)
+		if err != nil {
+			log.Fatalf("Failed to find prometheus deployment namespace: %v\n", err)
+		}
+	}
+
 	go func() {
 		w.requiredTerminations.Add(1)
 		for event := range w.Watch.ResultChan() {
@@ -110,19 +119,21 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 					}
 				}
 				staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
+				log.Printf("Deleted VM workload %s\n", wle.ObjectMeta.Name)
 			default: // add or update
-				log.Printf("handle update workload %s", wle.Spec.Address)
 				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
 
 				// Remove duplicates from the node IPs.
 				existsDupEP := isDuplicate(staticConfigurations, newTargetAddr)
 				if !existsDupEP {
+					log.Printf("handle update workload %s", wle.Spec.Address)
 					newTarget := make(map[string][]string)
 					newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
 					staticConfigurations = append(staticConfigurations, newTarget)
+					log.Printf("Registered VM workload %s \n", wle.ObjectMeta.Name)
 					break
 				}
-				log.Printf("workload %s already registered as %s\n", wle.Spec.Address, newTargetAddr)
+				log.Printf("VM workload %s exists\n", wle.ObjectMeta.Name)
 			}
 
 			// assign the updated static configurations to the config map
@@ -131,7 +142,7 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				log.Printf("update static configuration json failed: %v", err)
 			}
 			fileSDConfig.Data[w.sdFileName] = string(marshaledString)
-			if err := updatePromSDConfigMap(w.k8sClient, fileSDConfig); err != nil {
+			if err := updatePromSDConfigMap(w.k8sClient, fileSDConfig, w.namespace); err != nil {
 				log.Printf("update config map failed: %v\n", err)
 			}
 		}
@@ -148,8 +159,9 @@ func (w *Watcher) waitForShutdown(stop <-chan struct{}) {
 	}()
 }
 
+// get or create ConfigMap from a namespace with Prometheus deployment
 func (w *Watcher) getOrCreatePromSDConfigMap(client *kubernetes.Clientset) (*v1.ConfigMap, error) {
-	configMap, err := client.CoreV1().ConfigMaps("istio-system").
+	configMap, err := client.CoreV1().ConfigMaps(w.namespace).
 		Get(context.TODO(), "file-sd-config", metav1.GetOptions{})
 	if err == nil {
 		// config map exists, return directly
@@ -162,11 +174,28 @@ func (w *Watcher) getOrCreatePromSDConfigMap(client *kubernetes.Clientset) (*v1.
 		Data: make(map[string]string),
 	}
 	cfg.Data[w.sdFileName] = ""
-	if configMap, err = client.CoreV1().ConfigMaps("istio-system").Create(context.TODO(), cfg,
+	if configMap, err = client.CoreV1().ConfigMaps(w.namespace).Create(context.TODO(), cfg,
 		metav1.CreateOptions{}); err != nil {
 		return nil, err
 	}
 	return configMap, nil
+}
+
+func discoverPromNamespace(client *kubernetes.Clientset) (string, error) {
+	label := "prometheus"
+	labelSelector := metav1.LabelSelector{MatchLabels: map[string]string{"app": label}}
+	listOptions := metav1.ListOptions{
+		LabelSelector: labels.Set(labelSelector.MatchLabels).String(),
+	}
+
+	podsList, err := client.CoreV1().Pods("").List(context.TODO(), listOptions)
+	if err != nil {
+		return "", err
+	}
+
+	promNamespace := podsList.Items[0].Namespace
+	log.Printf("discover prometheus deployment in namespace %s\n", promNamespace)
+	return promNamespace, nil
 }
 
 // WaitSignal awaits for SIGINT or SIGTERM and closes the channel
@@ -177,9 +206,9 @@ func (w *Watcher) WaitSignal(stop chan struct{}) {
 	close(stop)
 }
 
-func updatePromSDConfigMap(client *kubernetes.Clientset, fileSDConfig *v1.ConfigMap) error {
+func updatePromSDConfigMap(client *kubernetes.Clientset, fileSDConfig *v1.ConfigMap, ns string) error {
 	// Write the update config map back to cluster
-	if _, err := client.CoreV1().ConfigMaps("istio-system").Update(context.TODO(), fileSDConfig,
+	if _, err := client.CoreV1().ConfigMaps(ns).Update(context.TODO(), fileSDConfig,
 		metav1.UpdateOptions{}); err != nil {
 		return err
 	}
