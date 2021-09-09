@@ -121,6 +121,7 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 				staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
 				log.Printf("Deleted VM workload %s\n", wle.ObjectMeta.Name)
 			default: // add or update
+				log.Printf("handle new node, event: %s, node: %v, origin: %#v\n", event.Type, wle, event.Object)
 				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
 
 				// Remove duplicates from the node IPs.
