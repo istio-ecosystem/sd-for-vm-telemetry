@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,8 +42,10 @@ type Watcher struct {
 	istioClient          *versioned.Clientset
 	k8sClient            *kubernetes.Clientset
 	namespace            string
+	watchLock            sync.Mutex
 	Watch                watch.Interface
 	requiredTerminations sync.WaitGroup
+	retry                chan int
 	sdFileName           string
 }
 
@@ -57,7 +60,6 @@ func NewWatcher(restConfig *rest.Config) *Watcher {
 	k8sClientSet, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		log.Fatalf("Failed to create k8s client: %s", err)
-
 	}
 	namespace := "" // get workload from all namespaces
 	watchWLE, err := ic.NetworkingV1beta1().WorkloadEntries(namespace).Watch(context.TODO(), metav1.ListOptions{})
@@ -68,7 +70,9 @@ func NewWatcher(restConfig *rest.Config) *Watcher {
 		istioClient: ic,
 		k8sClient:   k8sClientSet,
 		namespace:   namespace,
+		watchLock:   sync.Mutex{},
 		Watch:       watchWLE,
+		retry:       make(chan int),
 		sdFileName:  "staticConfigurations.json",
 	}
 	log.Println("workload entry watcher created")
@@ -85,76 +89,112 @@ func (w *Watcher) Start(stop <-chan struct{}) {
 		}
 	}
 
+	go w.handleEvent(1)
+
 	go func() {
-		w.requiredTerminations.Add(1)
-		for event := range w.Watch.ResultChan() {
-			// get the static configurations
-			fileSDConfig, err := w.getOrCreatePromSDConfigMap(w.k8sClient)
+		for restyNum := range w.retry {
+			w.watchLock.Lock()
+			w.Watch.Stop()
+			w.Watch = nil
+			w.watchLock.Unlock()
+
+			// max delay time 5min
+			delayTime := getTryDelayTime(restyNum)
+			log.Printf("Retry watch workloadentity in %ds\n", delayTime/time.Second)
+			<-time.After(delayTime)
+
+			watchWLE, err := w.istioClient.NetworkingV1beta1().WorkloadEntries("").Watch(context.TODO(), metav1.ListOptions{})
 			if err != nil {
-				log.Fatalf("get or create config map failed: %v\n", err)
+				log.Fatalf("Failed to get Workload Entry watch: %v", err)
 			}
-			var staticConfigurations []map[string][]string
-			if err := json.Unmarshal([]byte(fileSDConfig.Data[w.sdFileName]), &staticConfigurations); err != nil {
-				log.Println("static configuration json generation failed")
-			}
-
-			staticConfigurations = dedupConfig(staticConfigurations)
-
-			// handle events from the workload entries watch
-			wle, ok := event.Object.(*v1beta1.WorkloadEntry)
-			if !ok {
-				log.Print("unexpected type")
-			}
-			switch event.Type {
-			case watch.Deleted:
-				log.Printf("handle deleted workload %s", wle.Spec.Address)
-				toDelete := 0
-			outer:
-				for i, target := range staticConfigurations {
-					for _, ip := range target["targets"] {
-						if ip == wle.Spec.Address {
-							toDelete = i
-							break outer
-						}
-					}
-				}
-				staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
-				log.Printf("Deleted VM workload %s\n", wle.ObjectMeta.Name)
-			default: // add or update
-				newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
-
-				// Remove duplicates from the node IPs.
-				existsDupEP := isDuplicate(staticConfigurations, newTargetAddr)
-				if !existsDupEP {
-					log.Printf("handle update workload %s", wle.Spec.Address)
-					newTarget := make(map[string][]string)
-					newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
-					staticConfigurations = append(staticConfigurations, newTarget)
-					log.Printf("Registered VM workload %s \n", wle.ObjectMeta.Name)
-					break
-				}
-				log.Printf("VM workload %s exists\n", wle.ObjectMeta.Name)
-			}
-
-			// assign the updated static configurations to the config map
-			marshaledString, err := json.Marshal(staticConfigurations)
-			if err != nil {
-				log.Printf("update static configuration json failed: %v", err)
-			}
-			fileSDConfig.Data[w.sdFileName] = string(marshaledString)
-			if err := updatePromSDConfigMap(w.k8sClient, fileSDConfig, w.namespace); err != nil {
-				log.Printf("update config map failed: %v\n", err)
-			}
+			w.watchLock.Lock()
+			w.Watch = watchWLE
+			w.watchLock.Unlock()
+			go w.handleEvent(restyNum + 1)
 		}
-		w.requiredTerminations.Done()
 	}()
 	w.waitForShutdown(stop)
+}
+
+func (w *Watcher) handleEvent(retryNum int) {
+	w.requiredTerminations.Add(1)
+event:
+	for event := range w.Watch.ResultChan() {
+
+		// get the static configurations
+		fileSDConfig, err := w.getOrCreatePromSDConfigMap(w.k8sClient)
+		if err != nil {
+			log.Fatalf("get or create config map failed: %v\n", err)
+		}
+		var staticConfigurations []map[string][]string
+		if err := json.Unmarshal([]byte(fileSDConfig.Data[w.sdFileName]), &staticConfigurations); err != nil {
+			log.Println("static configuration json generation failed")
+		}
+
+		staticConfigurations = dedupConfig(staticConfigurations)
+
+		// handle events from the workload entries watch
+		wle, ok := event.Object.(*v1beta1.WorkloadEntry)
+		if !ok {
+			log.Print("unexpected type")
+		}
+		switch event.Type {
+		case watch.Deleted:
+			log.Printf("handle deleted workload %s", wle.Spec.Address)
+			toDelete := 0
+		outer:
+			for i, target := range staticConfigurations {
+				for _, ip := range target["targets"] {
+					if ip == wle.Spec.Address {
+						toDelete = i
+						break outer
+					}
+				}
+			}
+			staticConfigurations = append(staticConfigurations[:toDelete], staticConfigurations[toDelete+1:]...)
+			log.Printf("Deleted VM workload %s\n", wle.ObjectMeta.Name)
+		case watch.Error:
+			status := event.Object.(*metav1.Status)
+			log.Printf("watch return error, status: %s\n", status.String())
+			w.retry <- retryNum
+			break event
+		default: // add or update
+			newTargetAddr := fmt.Sprintf("%s:15020", wle.Spec.Address)
+
+			// Remove duplicates from the node IPs.
+			existsDupEP := isDuplicate(staticConfigurations, newTargetAddr)
+			if !existsDupEP {
+				log.Printf("handle update workload %s", wle.Spec.Address)
+				newTarget := make(map[string][]string)
+				newTarget["targets"] = append(newTarget["targets"], newTargetAddr)
+				staticConfigurations = append(staticConfigurations, newTarget)
+				log.Printf("Registered VM workload %s \n", wle.ObjectMeta.Name)
+				break
+			}
+			log.Printf("VM workload %s exists\n", wle.ObjectMeta.Name)
+		}
+
+		// assign the updated static configurations to the config map
+		marshaledString, err := json.Marshal(staticConfigurations)
+		if err != nil {
+			log.Printf("update static configuration json failed: %v", err)
+		}
+		fileSDConfig.Data[w.sdFileName] = string(marshaledString)
+		if err := updatePromSDConfigMap(w.k8sClient, fileSDConfig, w.namespace); err != nil {
+			log.Printf("update config map failed: %v\n", err)
+		}
+	}
+	w.requiredTerminations.Done()
 }
 
 func (w *Watcher) waitForShutdown(stop <-chan struct{}) {
 	go func() {
 		<-stop
-		w.Watch.Stop()
+		w.watchLock.Lock()
+		if w.Watch != nil {
+			w.Watch.Stop()
+		}
+		w.watchLock.Unlock()
 		w.requiredTerminations.Wait()
 	}()
 }
@@ -244,4 +284,13 @@ func dedupConfig(values []map[string][]string) []map[string][]string {
 		}
 	}
 	return config
+}
+
+func getTryDelayTime(retryNum int) time.Duration {
+	const maxDelayTime = time.Minute * 5
+	delayTime := 5 * time.Duration(retryNum*retryNum) * time.Second
+	if delayTime > maxDelayTime {
+		return maxDelayTime
+	}
+	return delayTime
 }
